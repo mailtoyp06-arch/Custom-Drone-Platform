@@ -37,14 +37,11 @@ Hardware diagrams and wiring can go in a hardware/ folder once you have them.
 # 🧩 How It Works
 <!-- ✏️ EDIT: once you have a wiring or system diagram, embed it here like this: <p align="center"> <img src="hardware/system_architecture.png" width="550"> </p> -->
 
-## The flight pipeline:
-
-[View system_architecture.png](hardware/system_architecture.png)
+## The flight pipeline
 
 <p align="center">
-  <img src="hardware/system_architecture.png" width="550">
+  <img src="https://github.com/user-attachments/assets/2c0cc548-c740-48b1-85a0-4cb8a56d6fbe" width="600" alt="System Architecture">
 </p>
-
 
 1. **RC controller** - Data comes from the flysky controller which is captured by the reciver.
 2. **IMU sensor:** - IMU reads orientation data has 9 axises of rotation which is sent to ESP32.
@@ -57,12 +54,16 @@ In RC mode, drone is controlled by using RC controller which sends signal to con
 ## Autonomous Version
 In autonomous mode, the drone will be able to go from point A to point B using a ground station which sends data to ESP32 for drone to go to. RC controller still needed when need to overide autonomous mode.
 # 🧠 Notable Engineering Problems
-1. **PID integral windup when starting drone**
-2. **Designing the custom PCB**
-3. **wrong heading for yaw by using true north instead of accelerometer of yaw**
-4. **use or wrong data ports like SPI, I2C, Serial 1, Serial 2 which caues various erros for connections and live data**  
-<!-- ✏️ EDIT: describe -->
-🚀 Getting Started
+1. **PID integral windup and motor saturation**
+   Before the drones takesoff, small anggles from roll, pitch and yaw caused the PID integral term to conninuosly acculmate. Thsi integral windup saturated motor outputs and cuased erractic flips upon arming. Gating the integrator accumilation until throttle passes hover threshold and addaing dyanmic anti windup clamping prevented the motor saturation and stablizedd groudn to air transitinos. 
+3. **Modular PCB hardware**
+    Directly sodler the sensitve compents like the ESP32 and the IMU to a custom PCB left them really vulnerable to physcial crash impacts and power shorts. Mounting compents onto female header soceksr decoupled teh mechancial stres wwhich created a sacrifical layer for crash impactact and enabled instatn compnet swaps without re-sodler the base board.  
+5. **Yaw snapback from magnometer control**
+   The targetign system tracked absolute north of the Earths mangetic lines which caused the lfight contrller to fight pilot stick inputs and snap back aggresseviely when sticks were realeased or local mangetic interfeces occurred. Changing the yaw axis from absolute heading control to gyro rate control loop allowed smooth stick commands while holding steady relative heading when hands off. 
+7. **Bus contention, WDT resets and timing spikes**
+The overlap across I2C,SPI and UART peripherals combined with blocking Serial.print() calls inside the core control loop caused the ESP32 watchdog Timer (WDT) panics and memory corrutppion. Restructuring perpheral pin assighments, removing blocking serial calls fomr the fast loop, and enforcing non blocking millis() timing schhedules resotred determinsitc 250Hz ececution.
+
+# 🚀 Getting Started
 <!-- ✏️ EDIT: fill this in once your code is actually in the repo — this is a placeholder structure based on a typical embedded/Arduino project -->
 1. Clone the repo
 bash
