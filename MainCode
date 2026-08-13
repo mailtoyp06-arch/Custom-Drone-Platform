@@ -1,0 +1,1340 @@
+/* =====================================================================================
+ *  My-Dro  -  ESP32 Quadcopter Flight Controller  (X configuration)
+ * =====================================================================================
+ *
+ *  WHAT THIS IS
+ *  ------------
+ *  A single-file, clean, heavily-commented flight controller for an ESP32-based drone.
+ *  It reads a FlySky/iBUS receiver, reads an LSM9DS1 IMU, fuses the sensors into a
+ *  stable roll/pitch/yaw estimate, runs a PID stabiliser, and drives 4 ESCs at
+ *  50 Hz / 11-bit resolution (as requested). A GPS module is read non-blocking and its
+ *  data is made available for telemetry and (optional) navigation.
+ *
+ *  This sketch was written from scratch to be READABLE, DEBUGGABLE and SAFE. It replaces
+ *  the older multi-tab "Drone" project which had several real bugs:
+ *     - IMU calibration values were assigned to LOCAL shadow variables, so the global
+ *       gyro-rate values used by the PID were never actually updated.
+ *     - The receiver channels were mapped inconsistently (roll/pitch/throttle swapped).
+ *     - The GPS was read with a blocking delay(1000) inside the flight loop, which
+ *       throttled the whole control loop down to ~1 Hz (a drone cannot fly like that).
+ *     - The heading-error wrap used `while (err < 180)` instead of `< -180` (infinite loop risk).
+ *     - There was no real arming sequence or receiver-loss failsafe.
+ *
+ *  ------------------------------------------------------------------------------------
+ *  HOW THE CODE IS ORGANISED (read top to bottom)
+ *    1. CONFIG            - pins, tuning gains, limits. THIS is the part you edit.
+ *    2. GLOBAL STATE      - shared runtime variables.
+ *    3. SENSORS           - IMU init + attitude estimation (complementary filter).
+ *    4. RECEIVER (iBUS)   - stick + switch decoding, with failsafe.
+ *    5. PID               - roll/pitch angle hold + yaw rate control.
+ *    6. MOTOR MIXER       - converts PID output to 4 ESC signals (50 Hz / 11-bit).
+ *    7. GPS               - non-blocking parsing + telemetry.
+ *    8. SAFETY / ARMING   - arm/disarm state machine, kill switch, tilt cutoff, failsafe.
+ *    9. DEBUG             - toggleable serial printing so you can inspect everything.
+ *   10. setup() / loop()  - wiring everything together at a fixed control rate.
+ *
+ *  ------------------------------------------------------------------------------------
+ *  REQUIRED LIBRARIES (install via Arduino Library Manager)
+ *    - Adafruit LSM9DS1     (by Adafruit)      + Adafruit Unified Sensor
+ *    - IBusBM               (by Bmellink)
+ *    - TinyGPSPlus          (by Mikal Hart)
+ *  Board: "ESP32 Dev Module" using the ESP32 Arduino core v3.x (the ledcAttach()
+ *         API used below is the v3.x form). If you are on core v2.x, see the note in
+ *         motorsSetup().
+ *
+ *  ------------------------------------------------------------------------------------
+ *  !!! SAFETY FIRST - READ BEFORE POWERING MOTORS !!!
+ *    - ALWAYS bench-test with PROPELLERS REMOVED first.
+ *    - Set your transmitter's FAILSAFE so that on signal loss the THROTTLE channel
+ *      drops BELOW its normal minimum (this code detects that and cuts the motors).
+ *    - Verify the motor spin directions and the mixer signs (MIX_* below) before flight.
+ *    - Keep the ARM switch within easy reach; flipping it to disarm cuts all motors.
+ * ===================================================================================== */
+
+#include <Wire.h>
+#include <Adafruit_LSM9DS1.h>
+#include <Adafruit_Sensor.h>
+#include <IBusBM.h>
+#include <TinyGPS++.h>
+#include <LittleFS.h>         // on-board flash filesystem for the flight data logger
+#include <SPI.h>              // nRF24 radio bus
+#include <RF24.h>             // nRF24L01 telemetry / waypoint link  (lib: "RF24" by TMRh20)
+#include <Adafruit_BMP280.h>  // barometric altitude sensor
+
+/* =====================================================================================
+ * 1. CONFIG  --  edit these to match YOUR hardware / tuning.
+ * ===================================================================================== */
+
+// ---- Debug -------------------------------------------------------------------------
+// Set DEBUG_ENABLED to 0 for the quietest / fastest loop once everything works.
+// Change DEBUG_MODE to look at different subsystems (see printDebug()).
+#define DEBUG_ENABLED 1
+#define DEBUG_MODE DBG_ATTITUDE  // DBG_RC | DBG_ATTITUDE | DBG_PID | DBG_MOTORS | DBG_GPS | DBG_STATE | DBG_NAV
+enum { DBG_RC,
+       DBG_ATTITUDE,
+       DBG_PID,
+       DBG_MOTORS,
+       DBG_GPS,
+       DBG_STATE,
+       DBG_NAV };
+const unsigned long DEBUG_INTERVAL_MS = 100;  // how often to print (ms)
+
+// ---- Flash data logger -------------------------------------------------------------
+// Records CSV rows (motors, roll/pitch/yaw, PID, GPS, ...) to the ESP32's internal
+// flash (LittleFS). Nothing extra to wire up. After a flight, plug in USB, open the
+// Serial Monitor at 115200 and type these commands (then Enter):
+//     help    - list commands
+//     dump    - print the whole log as CSV (copy/paste into a spreadsheet)
+//     size    - show how many bytes are logged
+//     erase   - wipe the log and start a fresh file
+//     stop    - pause logging      |   start - resume logging
+// The header row lists every column so it opens straight into Excel/Sheets.
+#define LOG_ENABLED 1
+const char* LOG_FILE_PATH = "/flightlog.csv";
+const unsigned long LOG_INTERVAL_MS = 20;  // log rate (20 ms == 50 rows/sec)
+const unsigned long LOG_FLUSH_MS = 1000;   // force-write buffered rows to flash this often
+const size_t LOG_MAX_BYTES = 1200000;      // ~1.2 MB cap (fits the default LittleFS partition)
+const bool LOG_ONLY_WHEN_ARMED = false;    // true == only record while ARMED (saves space)
+
+// ---- Pin map (from Pin-Details.txt) ------------------------------------------------
+// IMU / BMP280 share the I2C bus.
+const int PIN_I2C_SDA = 21;
+const int PIN_I2C_SCL = 22;
+
+// ESC signal pins (X-quad layout, viewed from above, "front" is the nose):
+//        FL (12)   FR (14)
+//              \   /
+//               \ /
+//               / \
+//              /   \
+//        BL (27)   BR (26)
+const int PIN_ESC_FL = 12;
+const int PIN_ESC_FR = 14;
+const int PIN_ESC_BL = 27;
+const int PIN_ESC_BR = 26;
+
+// iBUS receiver: ESP32 RX pin (connects to the receiver's iBUS/SERVO out).
+const int PIN_RC_RX = 16;  // ESP32 receives here
+const int PIN_RC_TX = -1;  // not used for iBUS servo data
+
+// GPS (from Pin-Details.txt): GPS-TX -> ESP32 GPIO32 (ESP32 RX),
+//                             ESP32 GPIO17 -> GPS-RX (ESP32 TX).
+const int PIN_GPS_RX = 32;  // ESP32 receives GPS data here
+const int PIN_GPS_TX = 17;  // ESP32 transmits to GPS here
+const long GPS_BAUD = 9600;
+
+// ---- ESC PWM (REQUIREMENT: 50 Hz, 11-bit resolution) -------------------------------
+const int ESC_FREQ_HZ = 50;                         // 50 Hz servo/ESC frame
+const int ESC_RESOLUTION = 11;                      // 11-bit  -> 0..2047 duty ticks
+const int ESC_MAX_TICK_FS = (1 << ESC_RESOLUTION);  // 2048 ticks == full 20 ms period
+// At 50 Hz the frame is 20000 us. Standard ESC pulses are 1000 us (idle) .. 2000 us (full).
+// duty_ticks = pulse_us / 20000us * 2048.  ->  1000us = 102,  2000us = 205,  1500us = 154.
+const int ESC_MIN_TICK = (int)(1000.0 / 20000.0 * ESC_MAX_TICK_FS + 0.5);  // ~102 = motors idle/armed
+const int ESC_MAX_TICK = (int)(2000.0 / 20000.0 * ESC_MAX_TICK_FS + 0.5);  // ~205 = full throttle
+
+// ---- Receiver channel assignment (0-indexed) ---------------------------------------
+// Standard AETR-ish layout. Adjust to match YOUR transmitter's channel order.
+const uint8_t CH_ROLL = 0;      // right stick L/R (aileron)
+const uint8_t CH_PITCH = 1;     // right stick U/D (elevator)
+const uint8_t CH_THROTTLE = 2;  // left  stick U/D
+const uint8_t CH_YAW = 3;       // left  stick L/R (rudder)
+const uint8_t CH_ARM = 4;       // AUX1: > 1500 == ARMED, otherwise DISARMED (also acts as kill)
+const uint8_t CH_AUX2 = 5;      // AUX2: reserved (e.g. GPS assist / mode) - not required to fly
+
+const int RC_MIN = 1000;  // expected receiver low
+const int RC_MID = 1500;  // expected receiver centre
+const int RC_MAX = 2000;  // expected receiver high
+
+// Failsafe: if throttle drops below this (set your TX failsafe to do so) OR channels
+// read outside the valid window OR no frames arrive for RC_TIMEOUT_MS -> cut motors.
+const int RC_VALID_MIN = 900;
+const int RC_VALID_MAX = 2100;
+const int FAILSAFE_THROTTLE = 950;  // TX failsafe should drive throttle below this
+const unsigned long RC_TIMEOUT_MS = 500;
+
+// ---- Pilot command scaling ---------------------------------------------------------
+const float MAX_TILT_ANGLE_DEG = 30.0;  // full roll/pitch stick commands this lean angle
+const float MAX_YAW_RATE_DPS = 150.0;   // full yaw stick commands this rotation rate (deg/s)
+const int ARMING_THROTTLE_MAX = 1090;   // must hold throttle below this to arm (safety)
+const int MOTOR_START_THROTTLE = 1100;  // above this the stabiliser mixes corrections in
+
+// ---- PID gains ---------------------------------------------------------------------
+// Start conservative. Tune P first (until it just starts to oscillate, then back off),
+// then D (to damp), then a little I (to hold level against drift). Props OFF for first tests.
+// ROLL and PITCH are ANGLE controllers (setpoint = desired lean angle in degrees).
+float ROLL_KP = 3.5, ROLL_KI = 0.005, ROLL_KD = .25;
+float PITCH_KP = 3.5, PITCH_KI = 0.005, PITCH_KD = .25;
+// YAW is a RATE controller (setpoint = desired deg/s). No D term on a rate loop.
+float YAW_KP = 2.0, YAW_KI = 0, YAW_KD = 0.0;
+
+const float PID_OUT_LIMIT = 250.0;  // max roll/pitch correction (in throttle-us units)
+const float YAW_OUT_LIMIT = 120.0;  // max yaw correction
+const float I_LIMIT = 150.0;        // integrator clamp (anti-windup)
+const float D_FILTER_ALPHA = 0.03;  // low-pass on the derivative term (0..1, smaller = smoother)
+
+// ---- Mixer sign flips (set to -1 if a correction acts the WRONG way) ---------------
+// If the drone tips the wrong direction / spins up on the wrong axis, flip the matching
+// sign here instead of rewiring. Verify each with props OFF by hand-tilting the frame.
+const float MIX_ROLL_SIGN = 1.0;
+const float MIX_PITCH_SIGN = -1.0;
+const float MIX_YAW_SIGN = 1.0;
+
+// ---- Attitude filter ---------------------------------------------------------------
+const float COMP_ALPHA = 0.99;              // complementary filter: trust in gyro vs accel
+const float SAFETY_TILT_CUTOFF_DEG = 60.0;  // if we exceed this lean, disarm (crash cutoff)
+
+// ---- IMU calibration (from Calibration-Data.txt) -----------------------------------
+// Accelerometer offsets (m/s^2) and gyro bias (deg/s). Re-run your calibration if the
+// craft does not sit at ~0 deg when level, or if it slowly rotates when yaw stick centred.
+const float AX_OFFSET = 0.003987424383677052f;
+const float AY_OFFSET = -0.250665924082651f;
+const float AZ_OFFSET = 0.08943392429105046f;
+const float GX_OFFSET = -4.446152490215188f;  // deg/s
+const float GY_OFFSET = 1.4438536437296747f;  // deg/s
+const float GZ_OFFSET = 0.0f;                 // deg/s
+const float ANGLE_OFFSET_ROLL = -1.10f;       // trim so a level craft reads ~0
+const float ANGLE_OFFSET_PITCH = -.8f;
+
+// ---- Startup auto-calibration + status signalling ----------------------------------
+// On power-up, with the drone sitting STILL and LEVEL, we average the IMU for a few
+// seconds and store the result so roll/pitch read ~0 and the gyro/yaw don't drift.
+// Feedback: onboard LED (always) + an optional buzzer (set PIN_BUZZER to use it).
+#define CALIB_ON_BOOT 1
+const unsigned long CALIB_MS = 5000;    // hold still this long (5 s)
+const int PIN_STATUS_LED = 2;           // onboard LED on most ESP32 dev boards
+const int PIN_BUZZER = -1;              // OPTIONAL: set to a spare GPIO (e.g. 13/25/33) for beeps; -1 = none
+const float CALIB_MOVE_GYRO_DPS = 8.0;  // if it rotates faster than this mid-calibration, warn
+
+// ---- Control loop rate -------------------------------------------------------------
+// The ESC *output* is 50 Hz (set above). The control math runs faster for stability.
+const unsigned long CONTROL_INTERVAL_US = 4000;  // 4 ms == 250 Hz control loop
+
+// ---- nRF24L01 radio link (waypoints in, telemetry out) -----------------------------
+// Wiring from Pin-Details.txt (VSPI): SCK=18, MISO=19, MOSI=23, CE=4, CSN=5.
+const int PIN_NRF_CE = 4;
+const int PIN_NRF_CSN = 5;
+const int PIN_NRF_SCK = 18;
+const int PIN_NRF_MISO = 19;
+const int PIN_NRF_MOSI = 23;
+// Two 5-char pipe addresses. MUST be identical (and swapped) on the transmitter side.
+const uint8_t NRF_ADDR_CMD[6] = "DRN01";      // ground -> drone (waypoint commands)
+const uint8_t NRF_ADDR_TELEM[6] = "GND01";    // drone -> ground (telemetry)
+const unsigned long TELEM_INTERVAL_MS = 100;  // send telemetry at 10 Hz
+
+// ---- Barometer (altitude) ----------------------------------------------------------
+const uint8_t BMP280_I2C_ADDR = 0x76;  // some boards are 0x77 - change if begin() fails
+const float SEA_LEVEL_HPA = 1013.25;   // only used before we capture a home baseline
+
+// ---- Flight mode switch ------------------------------------------------------------
+// Physical 3-pos/2-pos switch on the transmitter selects the mode. The ground web page
+// only supplies the destination; the pilot's switch is always the master authority.
+const uint8_t CH_MODE = CH_AUX2;          // AUX2 (channel 6): HIGH = AUTONOMOUS, LOW = RC
+const unsigned long HANDOVER_MS = 10000;  // AUTO->RC: hover this long so the pilot can grab the sticks
+
+// ---- Autonomous navigation tuning --------------------------------------------------
+const float NAV_MAX_TILT_DEG = 15.0;  // most the drone will lean while navigating (gentle)
+const float NAV_KP_POS = 0.08;        // lean angle per metre of distance error
+const float NAV_KP_YAW = 2.0;         // yaw rate (deg/s) per degree of heading error
+const float NAV_ARRIVAL_M = 2.5;      // within this radius we consider the waypoint reached
+// Flip these if the drone flies AWAY from the target instead of toward it (verify carefully!).
+const float NAV_PITCH_SIGN = -1.0;  // maps "forward" distance to a pitch command
+const float NAV_ROLL_SIGN = 1.0;    // maps "sideways" distance to a roll command
+
+// ---- Altitude hold tuning ----------------------------------------------------------
+const int HOVER_THROTTLE = 1500;                          // approx throttle that hovers YOUR craft (TUNE THIS!)
+const float ALT_KP = 60.0, ALT_KI = 15.0, ALT_KD = 40.0;  // altitude PID (output in throttle-us)
+const int ALT_THROTTLE_MIN = 1150;                        // auto throttle never commands below this...
+const int ALT_THROTTLE_MAX = 1850;                        // ...nor above this
+const float ALT_I_LIMIT = 200.0;
+
+// ---- Magnetometer calibration (from Calibration-Data.txt) --------------------------
+// Needed so autonomous mode knows which way the nose points (heading). Hard-iron offsets
+// then a soft-iron matrix. Re-run your mag calibration if headings look wrong.
+const float MX_OFFSET = 15.42, MY_OFFSET = 35.18, MZ_OFFSET = -92.99;
+const float MAG_M[3][3] = {
+  { 1.663, 0.107, -0.131 },
+  { 0.107, 0.697, -0.454 },
+  { -0.131, -0.454, 1.169 }
+};
+const float HEADING_OFFSET_DEG = 0.0;  // add a constant if your compass north is rotated
+
+/* =====================================================================================
+ * 2. GLOBAL STATE
+ * ===================================================================================== */
+
+// ------ Radio packet formats (MUST byte-for-byte match the transmitter sketch) ------
+// Lat/Lng are sent as fixed-point (degrees * 1e7) so the whole packet stays tiny and
+// well under the nRF24's 32-byte limit, with ~1 cm resolution.
+struct __attribute__((packed)) CommandPacket {
+  uint8_t mode;  // 0 = request RC, 1 = request AUTONOMOUS
+  int32_t lat;   // target latitude  * 1e7
+  int32_t lng;   // target longitude * 1e7
+  int16_t altM;  // target altitude in metres above the launch point
+  uint8_t seq;   // increments each send (lets us detect a fresh command)
+};
+
+struct __attribute__((packed)) TelemetryPacket {
+  uint8_t mode;    // 0 RC, 1 AUTO, 2 HANDOVER
+  uint8_t armed;   // 0/1
+  int16_t roll;    // deg * 100
+  int16_t pitch;   // deg * 100
+  int16_t yaw;     // heading deg * 100
+  int32_t lat;     // current latitude  * 1e7
+  int32_t lng;     // current longitude * 1e7
+  int16_t altDm;   // current altitude (metres above home) * 10
+  uint8_t sats;    // GPS satellites
+  uint16_t distM;  // distance to target (metres)
+};
+
+// Forward declarations (so function order below doesn't matter to the compiler).
+void sensorsSetup();
+void readAttitude(float dt);
+void receiverSetup();
+void readReceiver();
+void runStabiliser(float dt);
+void motorsSetup();
+void writeAllMotors(int ticks);
+void mixAndWriteMotors();
+void gpsSetup();
+void readGPS();
+void updateSafety();
+void printDebug();
+void loggerSetup();
+void logData();
+void handleSerialCommands();
+void dumpLog();
+void eraseLog();
+void rfSetup();
+void rfLoop();
+void baroSetup();
+void readBaro();
+void updateFlightMode();
+void applyModeCommands(float dt);
+void navigateTo(double tLat, double tLng, float tAltM, float dt);
+void signalSetup();
+void beep(int freq, int ms);
+void calibrateIMU();
+
+Adafruit_LSM9DS1 lsm = Adafruit_LSM9DS1();
+HardwareSerial gpsSerial(1);  // ESP32 UART1 for GPS
+TinyGPSPlus gps;
+IBusBM ibus;
+RF24 radio(PIN_NRF_CE, PIN_NRF_CSN);
+Adafruit_BMP280 bmp;
+
+bool imuOK = false;
+
+// Pilot commands (decoded from the receiver)
+float cmdRoll = 0;     // desired roll  angle (deg)
+float cmdPitch = 0;    // desired pitch angle (deg)
+float cmdYawRate = 0;  // desired yaw rate (deg/s)
+int cmdThrottle = RC_MIN;
+bool armSwitchHigh = false;
+
+// PID working state
+struct PID {
+  float integral = 0;
+  float dFilt = 0;
+  float prevMeas = 0;
+};
+PID pidRoll, pidPitch, pidYaw, pidAlt;  // pidAlt = altitude-hold controller
+float outRoll = 0, outPitch = 0, outYaw = 0;
+
+// Estimated attitude
+float angleRoll = 0;                             // deg
+float anglePitch = 0;                            // deg
+float gyroRoll = 0, gyroPitch = 0, gyroYaw = 0;  // deg/s (bias-corrected)
+float headingDeg = 0;                            // tilt-compensated compass heading 0..360 (TRUE heading, for navigation)
+float reportedYaw = 0;                           // yaw relative to power-on heading (reads ~0 at startup, -180..180)
+bool modeSwitchAuto = false;                     // physical RC switch: true == pilot selected AUTONOMOUS
+
+// Runtime IMU calibration (auto-measured at boot; seeded from the constants above).
+// gyroBias* are the deg/s to subtract; levelOff* are the resting angles to subtract.
+float gyroBiasRoll = GX_OFFSET;
+float gyroBiasPitch = GY_OFFSET;
+float gyroBiasYaw = GZ_OFFSET;
+float levelOffRoll = -ANGLE_OFFSET_ROLL;
+float levelOffPitch = -ANGLE_OFFSET_PITCH;
+float yawRef = 0;  // compass heading captured at end of calibration
+bool imuCalibrated = false;
+
+// Barometer / altitude
+bool baroOK = false;
+float altitudeM = 0;     // metres above the home baseline captured at arm
+float homeAltRawM = 0;   // raw baro altitude captured when we arm
+float climbRateMps = 0;  // vertical speed (m/s), filtered
+float prevAltM = 0;
+
+// Radio link + navigation
+bool rfOK = false;
+volatile bool haveWaypoint = false;  // a valid target has been received
+double targetLat = 0, targetLng = 0;
+float targetAltM = 0;
+uint8_t lastCmdSeq = 255;
+unsigned long lastCmdMs = 0;  // last time a command packet arrived
+unsigned long lastTelemMs = 0;
+float distToTargetM = 0;
+
+// Navigation controller state
+enum NavMode { NAV_RC,
+               NAV_AUTO,
+               NAV_HANDOVER };
+static const char* navModeName(NavMode m) {
+  return (m == NAV_AUTO) ? "AUTO" : (m == NAV_HANDOVER) ? "HANDOVER"
+                                                        : "RC";
+}
+NavMode navMode = NAV_RC;
+unsigned long handoverStartMs = 0;
+double holdLat = 0, holdLng = 0;  // captured position for handover / position-hold
+float holdAltM = 0;
+
+// Motor outputs (in duty ticks 0..2047)
+int motFL = 0, motFR = 0, motBL = 0, motBR = 0;
+
+// GPS state
+double gpsLat = 0, gpsLng = 0;
+bool gpsFix = false;
+int gpsSats = 0;
+
+// Flight / safety state
+enum FlightState { DISARMED,
+                   ARMED };
+FlightState flightState = DISARMED;
+const char* stateReason = "boot";  // human-readable last state change reason
+unsigned long lastRcFrameMs = 0;
+uint8_t lastRcCnt = 0;
+bool rcFailsafe = true;  // true until we get valid data
+
+unsigned long lastControlUs = 0;
+unsigned long lastDebugMs = 0;
+float loopDtSec = CONTROL_INTERVAL_US / 1000000.0;
+
+// Logger state
+File logFile;
+bool logMounted = false;  // LittleFS mounted OK
+bool loggingOn = false;   // actively recording (toggle with start/stop)
+bool logFull = false;     // hit the size cap
+unsigned long lastLogMs = 0;
+unsigned long lastFlushMs = 0;
+char serialCmd[24];  // buffer for USB serial commands
+uint8_t serialCmdLen = 0;
+
+/* =====================================================================================
+ * 3. SENSORS  --  IMU init + attitude estimation
+ * -------------------------------------------------------------------------------------
+ *  We use a COMPLEMENTARY FILTER (simpler and very robust vs a full Kalman filter):
+ *    angle = COMP_ALPHA * (angle + gyroRate*dt)  +  (1-COMP_ALPHA) * accelAngle
+ *  The gyro is trusted for fast motion; the accelerometer slowly corrects long-term drift.
+ *  Yaw is left as a pure RATE (deg/s) from the gyro, which is all the yaw PID needs and
+ *  avoids the noisy/drifty magnetometer heading.
+ * ===================================================================================== */
+void sensorsSetup() {
+  if (lsm.begin()) {
+    imuOK = true;
+    lsm.setupAccel(lsm.LSM9DS1_ACCELRANGE_8G);
+    lsm.setupMag(lsm.LSM9DS1_MAGGAIN_4GAUSS);
+    lsm.setupGyro(lsm.LSM9DS1_GYROSCALE_2000DPS);
+    Serial.println(F("[IMU] LSM9DS1 OK"));
+  } else {
+    imuOK = false;
+    Serial.println(F("[IMU] *** LSM9DS1 NOT FOUND - flight disabled ***"));
+  }
+}
+
+void readAttitude(float dt) {
+  if (!imuOK) {
+    angleRoll = anglePitch = 0;
+    gyroRoll = gyroPitch = gyroYaw = 0;
+    return;
+  }
+
+  sensors_event_t a, m, g, t;
+  lsm.getEvent(&a, &m, &g, &t);
+
+  // Calibrated accelerometer (m/s^2)
+  float ax = a.acceleration.x - AX_OFFSET;
+  float ay = a.acceleration.y - AY_OFFSET;
+  float az = a.acceleration.z - AZ_OFFSET;
+
+  // Calibrated gyro. Adafruit returns rad/s -> convert to deg/s, then remove the bias
+  // measured at boot (gyroBias*), so a stationary craft reads ~0 deg/s (no drift).
+  gyroRoll = (g.gyro.y * 180.0 / PI) - gyroBiasRoll;    // about X (roll)
+  gyroPitch = (g.gyro.x * 180.0 / PI) - gyroBiasPitch;  // about Y (pitch)
+  gyroYaw = (g.gyro.z * 180.0 / PI) - gyroBiasYaw;      // about Z (yaw)
+
+  // Angle from the accelerometer (gravity vector). Valid only when not accelerating hard.
+  // We subtract the resting angle measured at boot (levelOff*) so a level craft reads 0.
+  float accRoll = (atan2(ax, az) * 180.0 / PI) - levelOffRoll;
+  float accPitch = (atan2(-ay, sqrt(ay * ay + az * az)) * 180.0 / PI) - levelOffPitch;
+  // Complementary fusion: gyro for fast motion, accel to slowly correct drift.
+  angleRoll = COMP_ALPHA * (angleRoll + gyroRoll * dt) + (1.0 - COMP_ALPHA) * -accRoll;
+  anglePitch = COMP_ALPHA * (anglePitch + gyroPitch * dt) + (1.0 - COMP_ALPHA) * -accPitch;
+
+  // ---- Compass heading (for AUTONOMOUS navigation only) ----------------------------
+  // Apply hard-iron offset + soft-iron matrix, then tilt-compensate with roll/pitch so
+  // the heading stays correct while the craft leans.
+  float mxu = m.magnetic.x - MX_OFFSET;
+  float myu = m.magnetic.y - MY_OFFSET;
+  float mzu = m.magnetic.z - MZ_OFFSET;
+  float Mx = MAG_M[0][0] * mxu + MAG_M[0][1] * myu + MAG_M[0][2] * mzu;
+  float My = MAG_M[1][0] * mxu + MAG_M[1][1] * myu + MAG_M[1][2] * mzu;
+  float Mz = MAG_M[2][0] * mxu + MAG_M[2][1] * myu + MAG_M[2][2] * mzu;
+  float rollRad = angleRoll * PI / 180.0;
+  float pitchRad = -anglePitch * PI / 180.0;
+  float Xh = Mx * cos(pitchRad) + My * sin(rollRad) * sin(pitchRad) + Mz * cos(rollRad) * sin(pitchRad);
+  float Yh = My * cos(rollRad) - Mz * sin(rollRad);
+  float h = atan2(Yh, Xh) * 180.0 / PI + HEADING_OFFSET_DEG;
+  while (h < 0) h += 360.0;
+  while (h >= 360) h -= 360.0;
+  headingDeg = h;  // TRUE heading (navigation uses this)
+
+  // Yaw relative to the power-on heading, so the reported/telemetry yaw reads ~0 at
+  // startup (what you asked for). Navigation still uses the true headingDeg above.
+  float ry = headingDeg - yawRef;
+  while (ry > 180) ry -= 360;
+  while (ry < -180) ry += 360;
+  reportedYaw = ry;
+}
+
+/* =====================================================================================
+ * 3b. STARTUP AUTO-CALIBRATION + STATUS SIGNALLING
+ * -------------------------------------------------------------------------------------
+ *  On boot, with the craft still and level, average the IMU to learn:
+ *    - the gyro bias (deg/s) on each axis, so rates read 0 at rest (no yaw drift),
+ *    - the resting roll/pitch angle, so the attitude reads 0 when level,
+ *    - the current compass heading, used as the "yaw = 0" reference.
+ *  Feedback:  onboard LED (fast blink = calibrating, solid = ready) and, if you fit a
+ *  buzzer on PIN_BUZZER, one tone at the start and a rising double-tone when ready.
+ * ===================================================================================== */
+void signalSetup() {
+  pinMode(PIN_STATUS_LED, OUTPUT);
+  digitalWrite(PIN_STATUS_LED, LOW);
+  if (PIN_BUZZER >= 0) {
+    ledcAttach(PIN_BUZZER, 2000, 10);
+    ledcWrite(PIN_BUZZER, 0);
+  }
+}
+
+// Blocking beep (only used during setup, before flight). LED lights with the tone.
+void beep(int freq, int ms) {
+  digitalWrite(PIN_STATUS_LED, HIGH);
+  if (PIN_BUZZER >= 0) ledcWriteTone(PIN_BUZZER, freq);
+  delay(ms);
+  if (PIN_BUZZER >= 0) ledcWriteTone(PIN_BUZZER, 0);
+  digitalWrite(PIN_STATUS_LED, LOW);
+}
+
+void calibrateIMU() {
+#if CALIB_ON_BOOT
+  if (!imuOK) {
+    Serial.println(F("[CAL] IMU missing - skipping calibration"));
+    return;
+  }
+
+  Serial.println(F("[CAL] Keep the drone STILL and LEVEL for 5 seconds..."));
+  beep(1500, 350);  // "starting" tone
+
+  unsigned long start = millis(), lastBlink = 0;
+  bool ledOn = false;
+  double sgx = 0, sgy = 0, sgz = 0, sar = 0, sap = 0;
+  long n = 0;
+  float maxRate = 0;
+
+  while (millis() - start < CALIB_MS) {
+    sensors_event_t a, m, g, t;
+    lsm.getEvent(&a, &m, &g, &t);
+    float ax = a.acceleration.x - AX_OFFSET;
+    float ay = a.acceleration.y - AY_OFFSET;
+    float az = a.acceleration.z - AZ_OFFSET;
+    float rx = g.gyro.y * 180.0 / PI;
+    float ry = g.gyro.x * 180.0 / PI;
+    float rz = g.gyro.z * 180.0 / PI;
+
+    sgx += rx;
+    sgy += ry;
+    sgz += rz;
+    sar += (atan2(ax, az) * 180.0 / PI);
+    sap += (atan2(-ay, sqrt(ay * ay + az * az)) * 180.0 / PI);
+    float mag = max(fabs(rx - (sgx / (n + 1))), max(fabs(ry - (sgy / (n + 1))), fabs(rz - (sgz / (n + 1)))));
+    if (mag > maxRate) maxRate = mag;
+    n++;
+
+    if (millis() - lastBlink > 120) {
+      ledOn = !ledOn;
+      digitalWrite(PIN_STATUS_LED, ledOn);
+      lastBlink = millis();
+    }
+    delay(5);
+  }
+
+  if (n > 0) {
+    gyroBiasRoll = sgx / n;
+    gyroBiasPitch = sgy / n;
+    gyroBiasYaw = sgz / n;
+    levelOffRoll = sar / n;   // resting roll  -> subtracted so level reads 0
+    levelOffPitch = sap / n;  // resting pitch -> subtracted so level reads 0
+  }
+
+  // Reset the fused attitude to level and prime the PID derivative memory.
+  angleRoll = 0;
+  anglePitch = 0;
+  pidRoll.prevMeas = 0;
+  pidPitch.prevMeas = 0;
+  pidYaw.prevMeas = 0;
+
+  // Establish the yaw-zero reference from the current heading (one read with new offsets).
+  readAttitude(0.01);
+  yawRef = headingDeg;
+  imuCalibrated = true;
+
+  Serial.printf("[CAL] done  gyroBias=(%.2f,%.2f,%.2f) level=(%.2f,%.2f) yawRef=%.1f\n",
+                gyroBiasRoll, gyroBiasPitch, gyroBiasYaw, levelOffRoll, levelOffPitch, yawRef);
+  if (maxRate > CALIB_MOVE_GYRO_DPS)
+    Serial.println(F("[CAL] WARNING: motion detected during calibration - power-cycle and keep it still."));
+
+  // "Ready" signal: rising double beep + solid LED.
+  beep(2000, 120);
+  delay(70);
+  beep(2600, 220);
+  digitalWrite(PIN_STATUS_LED, HIGH);  // solid = ready to arm
+#endif
+}
+
+/* =====================================================================================
+ * 4. RECEIVER (iBUS)  --  decode sticks + switches, detect failsafe
+ * ===================================================================================== */
+void receiverSetup() {
+  Serial2.begin(115200, SERIAL_8N1, PIN_RC_RX, PIN_RC_TX);
+  ibus.begin(Serial2, IBUSBM_NOTIMER);  // NOTIMER: we pump it from loop() (no ISR crashes)
+  lastRcFrameMs = millis();
+}
+
+// Map a receiver channel to a symmetric range about centre (e.g. -30..+30 degrees).
+static float rcToRange(uint16_t v, float outAbs) {
+  v = constrain(v, (uint16_t)RC_MIN, (uint16_t)RC_MAX);
+  float norm = ((float)v - RC_MID) / ((RC_MAX - RC_MIN) / 2.0);  // -1..+1
+  return norm * outAbs;
+}
+
+void readReceiver() {
+  ibus.loop();  // must be called often in NOTIMER mode
+
+  uint16_t rawThr = ibus.readChannel(CH_THROTTLE);
+  uint16_t rawRoll = ibus.readChannel(CH_ROLL);
+  uint16_t rawPit = ibus.readChannel(CH_PITCH);
+  uint16_t rawYaw = ibus.readChannel(CH_YAW);
+  uint16_t rawArm = ibus.readChannel(CH_ARM);
+  uint16_t rawMode = ibus.readChannel(CH_MODE);
+
+  // ---- Failsafe detection ----------------------------------------------------------
+  // 1) A new frame updates ibus.cnt_rec. If it stops changing, the wire/RX died.
+  if (ibus.cnt_rec != lastRcCnt) {
+    lastRcCnt = ibus.cnt_rec;
+    lastRcFrameMs = millis();
+  }
+  bool stale = (millis() - lastRcFrameMs) > RC_TIMEOUT_MS;
+
+  // 2) Channels out of a sane window (0 == never received, >2100 == garbage/failsafe bits).
+  bool outOfRange = (rawThr < RC_VALID_MIN || rawThr > RC_VALID_MAX || rawRoll == 0 || rawPit == 0 || rawYaw == 0);
+
+  // 3) Transmitter-configured failsafe: throttle deliberately driven very low.
+  bool tstFailsafe = (rawThr > 0 && rawThr < FAILSAFE_THROTTLE);
+
+  rcFailsafe = stale || outOfRange || tstFailsafe;
+
+  if (rcFailsafe) {
+    // Safe defaults: no throttle, level sticks, treat arm switch as OFF.
+    cmdThrottle = RC_MIN;
+    cmdRoll = cmdPitch = cmdYawRate = 0;
+    armSwitchHigh = false;
+    modeSwitchAuto = false;
+    return;
+  }
+
+  cmdThrottle = constrain((int)rawThr, RC_MIN, RC_MAX);
+  cmdRoll = rcToRange(rawRoll, MAX_TILT_ANGLE_DEG);
+  cmdPitch = rcToRange(rawPit, MAX_TILT_ANGLE_DEG);
+  cmdYawRate = rcToRange(rawYaw, MAX_YAW_RATE_DPS);
+  if (fabs(cmdYawRate) < (MAX_YAW_RATE_DPS * 0.03)) cmdYawRate = 0;  // small deadband
+  armSwitchHigh = (rawArm > RC_MID);
+  modeSwitchAuto = (rawMode > RC_MID);
+}
+
+/* =====================================================================================
+ * 5. PID  --  stabilisation
+ *  A generic PID helper is used for all three axes so the logic is written once.
+ *   - roll/pitch: setpoint = desired ANGLE, measurement = estimated angle.
+ *   - yaw:        setpoint = desired RATE,  measurement = gyro yaw rate.
+ *  Includes: output clamp, integral clamp + anti-windup, and a low-pass filtered
+ *  derivative-on-measurement (avoids derivative kick when the setpoint jumps).
+ * ===================================================================================== */
+float runPID(PID& s, float setpoint, float meas, float kp, float ki, float kd,
+             float outLimit, float dt, bool allowIntegral) {
+  float error = setpoint - meas;
+
+  float P = kp * error;
+
+  if (allowIntegral) s.integral += ki * error * dt;
+  s.integral = constrain(s.integral, -I_LIMIT, I_LIMIT);
+  float I = s.integral;
+
+  // Derivative on measurement (not error) -> no spike when the pilot moves the stick.
+  float dMeas = (meas - s.prevMeas) / dt;
+  s.prevMeas = meas;
+  s.dFilt = D_FILTER_ALPHA * dMeas + (1.0 - D_FILTER_ALPHA) * s.dFilt;
+  float D = -kd * s.dFilt;
+
+  float out = P + I + D;
+
+  // Anti-windup: if we saturate, pull the overflow back out of the integrator.
+  if (out > outLimit) {
+    s.integral -= (out - outLimit);
+    out = outLimit;
+  } else if (out < -outLimit) {
+    s.integral += (-outLimit - out);
+    out = -outLimit;
+  }
+  return out;
+}
+
+void runStabiliser(float dt) {
+  // Only wind up the integrators once we are armed AND above the hover-ish threshold,
+  // so a small standing error on the bench cannot slowly ramp the motors.
+  bool allowI = (flightState == ARMED) && (cmdThrottle > MOTOR_START_THROTTLE + 100);
+
+  if (flightState != ARMED) {
+    // Keep everything reset while disarmed so we start clean the moment we arm.
+    pidRoll.integral = pidPitch.integral = pidYaw.integral = 0;
+    outRoll = outPitch = outYaw = 0;
+    pidRoll.prevMeas = angleRoll;
+    pidPitch.prevMeas = anglePitch;
+    pidYaw.prevMeas = gyroYaw;
+    return;
+  }
+
+  outRoll = runPID(pidRoll, cmdRoll, angleRoll, ROLL_KP, ROLL_KI, ROLL_KD, PID_OUT_LIMIT, dt, allowI);
+  outPitch = runPID(pidPitch, cmdPitch, anglePitch, PITCH_KP, PITCH_KI, PITCH_KD, PID_OUT_LIMIT, dt, allowI);
+  outYaw = runPID(pidYaw, cmdYawRate, gyroYaw, YAW_KP, YAW_KI, YAW_KD, YAW_OUT_LIMIT, dt, allowI);
+}
+
+/* =====================================================================================
+ * 6. MOTOR MIXER + ESC OUTPUT  (50 Hz, 11-bit)
+ * ===================================================================================== */
+void motorsSetup() {
+  // ESP32 Arduino core v3.x API. (v2.x users: use ledcSetup(ch,freq,res)+ledcAttachPin.)
+  ledcAttach(PIN_ESC_FL, ESC_FREQ_HZ, ESC_RESOLUTION);
+  ledcAttach(PIN_ESC_FR, ESC_FREQ_HZ, ESC_RESOLUTION);
+  ledcAttach(PIN_ESC_BR, ESC_FREQ_HZ, ESC_RESOLUTION);
+  ledcAttach(PIN_ESC_BL, ESC_FREQ_HZ, ESC_RESOLUTION);
+  writeAllMotors(ESC_MIN_TICK);  // send idle/arm pulse so ESCs initialise disarmed
+}
+
+void writeAllMotors(int ticks) {
+  ledcWrite(PIN_ESC_FL, ticks);
+  ledcWrite(PIN_ESC_FR, ticks);
+  ledcWrite(PIN_ESC_BL, ticks);
+  ledcWrite(PIN_ESC_BR, ticks);
+}
+
+// Convert a 1000..2000us throttle value to ESC duty ticks (102..205).
+static int usToTicks(float us) {
+  us = constrain(us, 1000.0f, 2000.0f);
+  return (int)(us / 20000.0f * ESC_MAX_TICK_FS + 0.5f);
+}
+
+void mixAndWriteMotors() {
+  if (flightState != ARMED) {
+    writeAllMotors(ESC_MIN_TICK);
+    motFL = motFR = motBL = motBR = ESC_MIN_TICK;
+    return;
+  }
+
+  // Below the start threshold: keep motors at idle so they spin slowly / are ready,
+  // but don't apply attitude corrections (prevents twitching on the ground).
+  if (cmdThrottle < MOTOR_START_THROTTLE) {
+    int idle = usToTicks(MOTOR_START_THROTTLE);
+    motFL = motFR = motBL = motBR = idle;
+    ledcWrite(PIN_ESC_FL, motFL);
+    ledcWrite(PIN_ESC_FR, motFR);
+    ledcWrite(PIN_ESC_BL, motBL);
+    ledcWrite(PIN_ESC_BR, motBR);
+    return;
+  }
+
+  float thr = cmdThrottle;
+  float r = outRoll * MIX_ROLL_SIGN;
+  float p = outPitch * MIX_PITCH_SIGN;
+  float y = outYaw * MIX_YAW_SIGN;
+
+  // X-quad mix (in throttle-us units). If an axis reacts backwards, flip its MIX_*_SIGN.
+  float fFL = thr + p + r + y;
+  float fFR = thr + p - r - y;
+  float fBL = thr - p + r - y;
+  float fBR = thr - p - r + y;
+
+  // AIR-MODE style clamp: shift all motors together so the *differences* (attitude
+  // authority) are preserved instead of individually clipping the low motor.
+  float lo = min(min(fFL, fFR), min(fBL, fBR));
+  float hi = max(max(fFL, fFR), max(fBL, fBR));
+  if (lo < 990) {
+    float s = 1000 - lo;
+    fFL += s;
+    fFR += s;
+    fBL += s;
+    fBR += s;
+  }
+  if (hi > 2100) {
+    float s = hi - 2000;
+    fFL -= s;
+    fFR -= s;
+    fBL -= s;
+    fBR -= s;
+  }
+
+  motFL = usToTicks(fFL);
+  motFR = usToTicks(fFR);
+  motBL = usToTicks(fBL);
+  motBR = usToTicks(fBR);
+
+  ledcWrite(PIN_ESC_FL, motFL);
+  ledcWrite(PIN_ESC_FR, motFR);
+  ledcWrite(PIN_ESC_BL, motBL);
+  ledcWrite(PIN_ESC_BR, motBR);
+}
+
+/* =====================================================================================
+ * 7. GPS  --  non-blocking parse + telemetry
+ *  IMPORTANT: never block the control loop. We only drain whatever bytes are waiting.
+ * ===================================================================================== */
+void gpsSetup() {
+  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+}
+
+void readGPS() {
+  while (gpsSerial.available() > 0) gps.encode(gpsSerial.read());
+  if (gps.location.isValid()) {
+    gpsLat = gps.location.lat();
+    gpsLng = gps.location.lng();
+    gpsFix = true;
+  } else {
+    gpsFix = false;
+  }
+  if (gps.satellites.isValid()) gpsSats = gps.satellites.value();
+}
+
+/* =====================================================================================
+ * 7b. BAROMETER  --  altitude above launch point + vertical speed
+ * ===================================================================================== */
+void baroSetup() {
+  if (bmp.begin(BMP280_I2C_ADDR)) {
+    baroOK = true;
+    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL, Adafruit_BMP280::SAMPLING_X2,
+                    Adafruit_BMP280::SAMPLING_X16, Adafruit_BMP280::FILTER_X16,
+                    Adafruit_BMP280::STANDBY_MS_1);
+    Serial.println(F("[BARO] BMP280 OK"));
+  } else {
+    baroOK = false;
+    Serial.println(F("[BARO] BMP280 not found (altitude hold disabled)"));
+  }
+}
+
+// Reads at ~40 Hz (I2C is slow); altitudeM is metres ABOVE the baseline captured at arm.
+void readBaro() {
+  if (!baroOK) {
+    altitudeM = 0;
+    climbRateMps = 0;
+    return;
+  }
+  static unsigned long lastMs = 0;
+  unsigned long now = millis();
+  if (now - lastMs < 25) return;
+  float dt = (now - lastMs) / 1000.0;
+  if (dt <= 0) dt = 0.025;
+  lastMs = now;
+
+  float raw = bmp.readAltitude(SEA_LEVEL_HPA);  // metres (absolute-ish)
+  altitudeM = raw - homeAltRawM;                // relative to home
+  float inst = (altitudeM - prevAltM) / dt;
+  climbRateMps = 0.8 * climbRateMps + 0.2 * inst;  // low-pass the vertical speed
+  prevAltM = altitudeM;
+}
+
+/* =====================================================================================
+ * 7c. nRF24L01 RADIO LINK  --  receive waypoint commands, send telemetry
+ *  Half-duplex: we listen for commands and briefly switch to TX to send telemetry.
+ *  Packet layouts are defined at the top and MUST match the transmitter sketch.
+ * ===================================================================================== */
+void rfSetup() {
+  SPI.begin(PIN_NRF_SCK, PIN_NRF_MISO, PIN_NRF_MOSI, PIN_NRF_CSN);
+  if (!radio.begin()) {
+    rfOK = false;
+    Serial.println(F("[nRF] not responding (waypoint link disabled)"));
+    return;
+  }
+  rfOK = true;
+  radio.setPALevel(RF24_PA_LOW);    // use RF24_PA_HIGH/MAX with a good antenna module
+  radio.setDataRate(RF24_250KBPS);  // slowest rate = best range/reliability
+  radio.setRetries(3, 5);           // (delay, count) - keep TX time bounded
+  radio.openWritingPipe(NRF_ADDR_TELEM);
+  radio.openReadingPipe(1, NRF_ADDR_CMD);
+  radio.startListening();
+  Serial.println(F("[nRF] radio ready"));
+}
+
+void rfLoop() {
+  if (!rfOK) return;
+
+  // ---- Receive waypoint commands from the ground station ----
+  if (radio.available()) {
+    CommandPacket cp;
+    radio.read(&cp, sizeof(cp));
+    lastCmdMs = millis();
+    if (cp.seq != lastCmdSeq) lastCmdSeq = cp.seq;  // fresh command
+    if (cp.lat != 0 || cp.lng != 0) {               // valid coordinate
+      targetLat = cp.lat / 1e7;
+      targetLng = cp.lng / 1e7;
+      targetAltM = cp.altM;
+      haveWaypoint = true;
+    }
+  }
+
+  // ---- Send telemetry back to the ground station ----
+  if (millis() - lastTelemMs >= TELEM_INTERVAL_MS) {
+    lastTelemMs = millis();
+    TelemetryPacket tp;
+    tp.mode = (uint8_t)navMode;
+    tp.armed = (flightState == ARMED) ? 1 : 0;
+    tp.roll = (int16_t)(angleRoll * 100);
+    tp.pitch = (int16_t)(anglePitch * 100);
+    tp.yaw = (int16_t)(reportedYaw * 100);  // yaw relative to power-on (0 at startup)
+    tp.lat = (int32_t)(gpsLat * 1e7);
+    tp.lng = (int32_t)(gpsLng * 1e7);
+    tp.altDm = (int16_t)(altitudeM * 10);
+    tp.sats = (uint8_t)gpsSats;
+    tp.distM = (uint16_t)constrain(distToTargetM, 0.0f, 65535.0f);
+    radio.stopListening();
+    radio.write(&tp, sizeof(tp));
+    radio.startListening();
+  }
+}
+
+/* =====================================================================================
+ * 7d. AUTONOMOUS NAVIGATION + FLIGHT-MODE STATE MACHINE
+ * -------------------------------------------------------------------------------------
+ *  navigateTo() converts a GPS target + altitude into the SAME command variables the RC
+ *  sticks would set (cmdRoll/cmdPitch/cmdYawRate/cmdThrottle), so the existing stabiliser
+ *  and mixer fly it. It turns the nose toward the target, leans forward to fly there, and
+ *  uses the barometer + altitude PID to hold the requested height.
+ *
+ *  Modes (navMode):
+ *    NAV_RC       - pilot has full stick control (default & failsafe).
+ *    NAV_AUTO     - fly to the received waypoint (or hover in place if none yet).
+ *    NAV_HANDOVER - AUTO->RC transition: hold position for HANDOVER_MS (10 s) so the
+ *                   pilot has time to grab the controller, THEN hand control back to RC.
+ *  The pilot's physical mode switch is always the master authority (safety).
+ * ===================================================================================== */
+void navigateTo(double tLat, double tLng, float tAltM, float dt) {
+  if (gpsFix) {
+    distToTargetM = TinyGPSPlus::distanceBetween(gpsLat, gpsLng, tLat, tLng);
+    float bearing = TinyGPSPlus::courseTo(gpsLat, gpsLng, tLat, tLng);  // 0..360 toward target
+    float herr = bearing - headingDeg;                                  // heading error
+    while (herr > 180) herr -= 360;
+    while (herr < -180) herr += 360;
+
+    if (distToTargetM <= NAV_ARRIVAL_M) {
+      cmdRoll = 0;
+      cmdPitch = 0;
+      cmdYawRate = 0;  // arrived -> hover
+    } else {
+      float herrRad = herr * PI / 180.0;
+      float fwd = distToTargetM * cos(herrRad);   // component in front of the nose
+      float side = distToTargetM * sin(herrRad);  // component to the side
+      cmdPitch = NAV_PITCH_SIGN * constrain(NAV_KP_POS * fwd, -NAV_MAX_TILT_DEG, NAV_MAX_TILT_DEG);
+      cmdRoll = NAV_ROLL_SIGN * constrain(NAV_KP_POS * side, -NAV_MAX_TILT_DEG, NAV_MAX_TILT_DEG);
+      cmdYawRate = constrain(NAV_KP_YAW * herr, -MAX_YAW_RATE_DPS, MAX_YAW_RATE_DPS);  // turn toward target
+    }
+  } else {
+    // No GPS fix: stay level, do not attempt horizontal motion.
+    cmdRoll = 0;
+    cmdPitch = 0;
+    cmdYawRate = 0;
+    distToTargetM = 0;
+  }
+
+  // Altitude hold -> throttle. runPID's derivative-on-measurement damps vertical speed.
+  float altOut = runPID(pidAlt, tAltM, altitudeM, ALT_KP, ALT_KI, ALT_KD, ALT_I_LIMIT + 200.0, dt, true);
+  cmdThrottle = constrain(HOVER_THROTTLE + (int)altOut, ALT_THROTTLE_MIN, ALT_THROTTLE_MAX);
+}
+
+void updateFlightMode() {
+  if (flightState != ARMED) {
+    navMode = NAV_RC;
+    return;
+  }
+
+  // AUTONOMOUS requires the pilot's switch AND a GPS fix (never fly blind).
+  bool autoAllowed = modeSwitchAuto && gpsFix;
+
+  switch (navMode) {
+    case NAV_RC:
+      if (autoAllowed) {
+        navMode = NAV_AUTO;
+        pidAlt.integral = 0;
+        pidAlt.prevMeas = altitudeM;
+        pidAlt.dFilt = 0;  // clean altitude handoff
+        if (!haveWaypoint) {
+          holdLat = gpsLat;
+          holdLng = gpsLng;
+          holdAltM = altitudeM;
+        }
+      }
+      break;
+
+    case NAV_AUTO:
+      if (!modeSwitchAuto) {  // pilot asked to return to RC
+        navMode = NAV_HANDOVER;
+        handoverStartMs = millis();
+        holdLat = gpsLat;
+        holdLng = gpsLng;
+        holdAltM = altitudeM;  // freeze here and hover
+        pidAlt.integral = 0;
+        pidAlt.prevMeas = altitudeM;
+        pidAlt.dFilt = 0;
+      }
+      break;
+
+    case NAV_HANDOVER:
+      if (modeSwitchAuto) {  // flipped back to AUTO -> cancel handover
+        navMode = NAV_AUTO;
+      } else if (millis() - handoverStartMs >= HANDOVER_MS) {
+        navMode = NAV_RC;  // 10 s elapsed -> pilot now has the sticks
+      }
+      break;
+  }
+}
+
+// Runs after readReceiver() (RC sticks) and updateFlightMode(). In AUTO/HANDOVER it
+// OVERWRITES the stick commands with the navigation outputs.
+void applyModeCommands(float dt) {
+  switch (navMode) {
+    case NAV_RC:
+      // Keep the stick commands already decoded in readReceiver(). Nothing to do.
+      break;
+    case NAV_AUTO:
+      if (haveWaypoint) navigateTo(targetLat, targetLng, targetAltM, dt);
+      else navigateTo(holdLat, holdLng, holdAltM, dt);  // hover until a waypoint arrives
+      break;
+    case NAV_HANDOVER:
+      navigateTo(holdLat, holdLng, holdAltM, dt);  // hold position for the pilot
+      break;
+  }
+}
+
+/* =====================================================================================
+ * 8. SAFETY / ARMING STATE MACHINE
+ *  Rules (all must be safe to fly):
+ *    - To ARM: arm switch HIGH, throttle held LOW, IMU healthy, and no RC failsafe.
+ *    - To DISARM (immediately): arm switch LOW, OR RC failsafe/timeout, OR tilt > cutoff.
+ * ===================================================================================== */
+void updateSafety() {
+  bool tiltExceeded = (fabs(angleRoll) > SAFETY_TILT_CUTOFF_DEG || fabs(anglePitch) > SAFETY_TILT_CUTOFF_DEG);
+
+  if (flightState == ARMED) {
+    if (!armSwitchHigh) {
+      flightState = DISARMED;
+      stateReason = "arm switch off";
+    } else if (rcFailsafe) {
+      flightState = DISARMED;
+      stateReason = "RC failsafe";
+    } else if (tiltExceeded) {
+      flightState = DISARMED;
+      stateReason = "tilt cutoff";
+    } else if (!imuOK) {
+      flightState = DISARMED;
+      stateReason = "IMU lost";
+    }
+  } else {  // DISARMED
+    bool canArm = armSwitchHigh && !rcFailsafe && imuOK && (cmdThrottle <= ARMING_THROTTLE_MAX);
+    if (canArm) {
+      flightState = ARMED;
+      stateReason = "armed";
+      // Capture the launch altitude so altitude-hold is "metres above where I took off".
+      if (baroOK) homeAltRawM = bmp.readAltitude(SEA_LEVEL_HPA);
+      altitudeM = 0;
+      prevAltM = 0;
+      climbRateMps = 0;
+      navMode = NAV_RC;  // always start a flight in RC mode
+    }
+  }
+}
+
+/* =====================================================================================
+ * 9. DEBUG  --  toggleable serial inspection (see DEBUG_MODE at the top)
+ * ===================================================================================== */
+void printDebug() {
+#if DEBUG_ENABLED
+  if (millis() - lastDebugMs < DEBUG_INTERVAL_MS) return;
+  lastDebugMs = millis();
+
+  switch (DEBUG_MODE) {
+    case DBG_RC:
+      Serial.printf("RC  thr:%4d roll:%+6.1f pitch:%+6.1f yawRate:%+6.1f arm:%d FS:%d\n",
+                    cmdThrottle, cmdRoll, cmdPitch, cmdYawRate, armSwitchHigh, rcFailsafe);
+      break;
+    case DBG_ATTITUDE:
+      Serial.printf("ATT roll:%+7.2f pitch:%+7.2f yaw:%+7.2f (hdg:%5.1f) cal:%d\n",
+                    angleRoll, anglePitch, reportedYaw, headingDeg, imuCalibrated);
+      break;
+    case DBG_PID:
+      Serial.printf("PID outR:%+7.1f outP:%+7.1f outY:%+7.1f\n", outRoll, outPitch, outYaw);
+      break;
+    case DBG_MOTORS:
+      Serial.printf("MOT FL:%4d FR:%4d BL:%4d BR:%4d (ticks)\n", motFL, motFR, motBL, motBR);
+      break;
+    case DBG_GPS:
+      Serial.printf("GPS fix:%d sats:%d lat:%.6f lng:%.6f\n", gpsFix, gpsSats, gpsLat, gpsLng);
+      break;
+    case DBG_STATE:
+      Serial.printf("STATE %-8s reason:%-16s thr:%4d FS:%d imu:%d\n",
+                    flightState == ARMED ? "ARMED" : "DISARMED", stateReason,
+                    cmdThrottle, rcFailsafe, imuOK);
+      break;
+    case DBG_NAV:
+      Serial.printf("NAV %-8s wp:%d hdg:%5.1f alt:%6.2f dist:%6.1f tgt:%.6f,%.6f rf:%d\n",
+                    navModeName(navMode), haveWaypoint, headingDeg, altitudeM,
+                    distToTargetM, targetLat, targetLng, rfOK);
+      break;
+  }
+#endif
+}
+
+/* =====================================================================================
+ * 10. FLASH DATA LOGGER  (LittleFS on the ESP32's internal flash)
+ * -------------------------------------------------------------------------------------
+ *  Writes one CSV row every LOG_INTERVAL_MS with everything you need to debug a flight:
+ *  the motor outputs, the roll/pitch/yaw estimates and commands, the PID outputs, arm
+ *  state and GPS. Retrieve it over USB with the `dump` serial command (see config).
+ *
+ *  Design notes:
+ *   - The file handle stays open in append mode; we only flush() every LOG_FLUSH_MS so
+ *     flash writes are batched and don't stall the 250 Hz control loop.
+ *   - When the file reaches LOG_MAX_BYTES we stop (keeping the earliest data) and tell
+ *     you to `dump` then `erase`. This protects the flash and never blocks flight.
+ * ===================================================================================== */
+const char* LOG_HEADER =
+  "ms,state,navmode,thr,cmdRoll,cmdPitch,cmdYawRate,roll,pitch,heading,gyroYaw,"
+  "outRoll,outPitch,outYaw,mFL,mFR,mBL,mBR,alt,climb,failsafe,imu,gpsFix,sats,"
+  "lat,lng,tgtLat,tgtLng,tgtAlt,dist";
+
+void loggerSetup() {
+#if LOG_ENABLED
+  // format-on-fail = true: if the flash has never held a filesystem, make one.
+  if (!LittleFS.begin(true)) {
+    Serial.println(F("[LOG] LittleFS mount FAILED - logging disabled"));
+    logMounted = false;
+    return;
+  }
+  logMounted = true;
+
+  // If the file doesn't exist yet, create it and write the CSV header row.
+  bool needHeader = !LittleFS.exists(LOG_FILE_PATH);
+  logFile = LittleFS.open(LOG_FILE_PATH, needHeader ? "w" : "a");
+  if (!logFile) {
+    Serial.println(F("[LOG] could not open log file"));
+    logMounted = false;
+    return;
+  }
+  if (needHeader) {
+    logFile.println(LOG_HEADER);
+    logFile.flush();
+  }
+
+  logFull = (logFile.size() >= LOG_MAX_BYTES);
+  loggingOn = !logFull;
+  Serial.printf("[LOG] ready: %s (%u bytes). Type 'help' over USB for commands.\n",
+                LOG_FILE_PATH, (unsigned)logFile.size());
+#endif
+}
+
+void logData() {
+#if LOG_ENABLED
+  if (!logMounted || !loggingOn || logFull) return;
+  if (LOG_ONLY_WHEN_ARMED && flightState != ARMED) return;
+  if (millis() - lastLogMs < LOG_INTERVAL_MS) return;
+  lastLogMs = millis();
+
+  if (logFile.size() >= LOG_MAX_BYTES) {
+    logFull = true;
+    loggingOn = false;
+    logFile.flush();
+    Serial.println(F("[LOG] file full - stopped. Use 'dump' then 'erase'."));
+    return;
+  }
+
+  // One CSV row. printf keeps this compact and fast.
+  logFile.printf("%lu,%s,%s,%d,%.1f,%.1f,%.1f,%.2f,%.2f,%.1f,%.2f,%.1f,%.1f,%.1f,"
+                 "%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.1f,%.1f\n",
+                 millis(),
+                 (flightState == ARMED) ? "ARMED" : "DISARM",
+                 navModeName(navMode),
+                 cmdThrottle, cmdRoll, cmdPitch, cmdYawRate,
+                 angleRoll, anglePitch, headingDeg, gyroYaw,
+                 outRoll, outPitch, outYaw,
+                 motFL, motFR, motBL, motBR,
+                 altitudeM, climbRateMps,
+                 rcFailsafe ? 1 : 0, imuOK ? 1 : 0,
+                 gpsFix ? 1 : 0, gpsSats, gpsLat, gpsLng,
+                 targetLat, targetLng, targetAltM, distToTargetM);
+
+  if (millis() - lastFlushMs >= LOG_FLUSH_MS) {
+    logFile.flush();
+    lastFlushMs = millis();
+  }
+#endif
+}
+
+void dumpLog() {
+#if LOG_ENABLED
+  if (!logMounted) {
+    Serial.println(F("[LOG] not mounted"));
+    return;
+  }
+  logFile.flush();  // make sure buffered rows are on flash
+  File f = LittleFS.open(LOG_FILE_PATH, "r");
+  if (!f) {
+    Serial.println(F("[LOG] cannot open for read"));
+    return;
+  }
+  Serial.println(F("----- BEGIN FLIGHT LOG -----"));
+  while (f.available()) Serial.write(f.read());
+  Serial.println(F("------ END FLIGHT LOG ------"));
+  f.close();
+#endif
+}
+
+void eraseLog() {
+#if LOG_ENABLED
+  if (logFile) logFile.close();
+  LittleFS.remove(LOG_FILE_PATH);
+  logFile = LittleFS.open(LOG_FILE_PATH, "w");
+  if (logFile) {
+    logFile.println(LOG_HEADER);
+    logFile.flush();
+  }
+  logFull = false;
+  loggingOn = true;
+  Serial.println(F("[LOG] erased - fresh log started"));
+#endif
+}
+
+// Reads single-line commands from the USB serial monitor (see config for the list).
+void handleSerialCommands() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serialCmdLen == 0) continue;
+      serialCmd[serialCmdLen] = '\0';
+      for (uint8_t i = 0; i < serialCmdLen; i++) serialCmd[i] = tolower(serialCmd[i]);
+
+      if (!strcmp(serialCmd, "help")) {
+        Serial.println(F("Commands: help | dump | size | erase | stop | start | cal | reboot"));
+      } else if (!strcmp(serialCmd, "cal") || !strcmp(serialCmd, "recal")) {
+        Serial.println(F("[SYS] Re-running IMU calibration... Keep drone STILL and LEVEL"));
+        calibrateIMU();
+      } else if (!strcmp(serialCmd, "reboot") || !strcmp(serialCmd, "reset")) {
+        Serial.println(F("[SYS] Rebooting ESP32..."));
+        delay(100);
+        ESP.restart(); // Performs software reboot equivalent to pressing EN button
+      } else if (!strcmp(serialCmd, "dump")) {
+        dumpLog();
+      } else if (!strcmp(serialCmd, "erase")) {
+        eraseLog();
+      } else if (!strcmp(serialCmd, "size")) {
+        Serial.printf("[LOG] %u bytes (max %u)\n",
+                      logMounted ? (unsigned)logFile.size() : 0, (unsigned)LOG_MAX_BYTES);
+      } else if (!strcmp(serialCmd, "stop")) {
+        loggingOn = false;
+        Serial.println(F("[LOG] paused"));
+      } else if (!strcmp(serialCmd, "start")) {
+        if (logFull) Serial.println(F("[LOG] file full - erase first"));
+        else {
+          loggingOn = true;
+          Serial.println(F("[LOG] resumed"));
+        }
+      } else {
+        Serial.printf("[LOG] unknown '%s' (try help)\n", serialCmd);
+      }
+
+      serialCmdLen = 0;
+    } else if (serialCmdLen < sizeof(serialCmd) - 1) {
+      serialCmd[serialCmdLen++] = c;
+    }
+  }
+}
+
+/* =====================================================================================
+ * 11. setup() / loop()
+ * ===================================================================================== */
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println(F("\n=== My-Dro flight controller booting ==="));
+
+  signalSetup();  // LED + optional buzzer ready for status tones
+
+  // Motors FIRST so ESCs get their idle pulse immediately on power-up.
+  motorsSetup();
+  Serial.println(F("[1/4] ESCs @50Hz/11-bit initialised (idle)"));
+
+  receiverSetup();
+  Serial.println(F("[2/4] iBUS receiver initialised"));
+
+  gpsSetup();
+  Serial.println(F("[3/4] GPS serial initialised"));
+
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  Wire.setClock(400000);
+  sensorsSetup();
+  baroSetup();
+  Serial.println(F("[4/6] IMU + barometer setup done"));
+
+  // Zero the axes now (drone must be sitting still & level). Beeps/LED indicate progress.
+  calibrateIMU();
+
+  rfSetup();
+  Serial.println(F("[5/6] nRF24 waypoint link setup done"));
+
+  loggerSetup();
+  Serial.println(F("[6/6] logger ready"));
+
+  Serial.println(F("Ready. Hold throttle LOW and flip ARM switch to arm.\n"));
+  lastControlUs = micros();
+}
+
+void loop() {
+  // Pump the receiver, GPS and radio every pass so no bytes/packets are lost.
+  ibus.loop();
+  readGPS();
+  readBaro();              // self-throttled to ~40 Hz internally
+  rfLoop();                // waypoint in / telemetry out
+  handleSerialCommands();  // respond to USB commands (dump/erase/etc) any time
+
+  // Fixed-rate control loop (250 Hz). Everything time-sensitive runs here.
+  unsigned long now = micros();
+  if (now - lastControlUs >= CONTROL_INTERVAL_US) {
+    loopDtSec = (now - lastControlUs) / 1000000.0;
+    if (loopDtSec <= 0) loopDtSec = CONTROL_INTERVAL_US / 1000000.0;
+    lastControlUs = now;
+
+    readReceiver();                // decode sticks + failsafe (also sets RC command values)
+    readAttitude(loopDtSec);       // fuse IMU into roll/pitch + compass heading
+    updateSafety();                // arm/disarm/kill decisions
+    updateFlightMode();            // RC / AUTO / 10 s HANDOVER state machine
+    applyModeCommands(loopDtSec);  // in AUTO/HANDOVER, override sticks with navigation
+    runStabiliser(loopDtSec);      // PID
+    mixAndWriteMotors();           // drive the ESCs
+
+    logData();  // append a CSV row to flash (batched writes)
+    printDebug();
+  }
+}
