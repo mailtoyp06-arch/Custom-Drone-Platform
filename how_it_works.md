@@ -11,3 +11,11 @@
 
 ## Numerous times threads running 
 
+| Thread | Job |
+|--------|-----|
+| Main | Reads WebSocket events, drives the filter state machine |
+| ESC | keeps readign PWM signals from the ESP32 |
+| Reciver | keeps waitign for singals from flysky controller so it can give to ESP32 |
+| Bluetooth watchdog | Independently monitors and recovers the Bluetooth connection |
+| IMU sensor | non stop data coming into ESP32 for kalman filter and PID to get processed by ESP32 |
+
