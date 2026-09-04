@@ -8,6 +8,7 @@ I built a custom-built quadcopter, specifically, the frame, custom PCB, and flig
 This drone uses a ESP32 to controll the whole drone where it has 4 motors to controls its rolling, pitch and yaw and uses a lipo battery. This first version of the drone is was just for the RC version. The second version here is for both RC and autonmous where the second version from the mistakes of the first one and and made to be bigger to handle more compenents need be.  -->
 
 ⚠️ This repository is still being documented — more build notes and diagrams will be added soon.
+# Drone Photos 
 
 # 🌍 Project Background
 
@@ -27,10 +28,19 @@ Component	Purpose
 |-----------|---------|
 |ESP32|Main controller, runs flight firmware|
 |Custom PCB|Power distribution and signal routing|
-|ESC|provides PWM singals at right time for motors to spin|
-|Motors|flys the drone by providing thrust|
+|ESC (GForces 30A Brushless)|provides PWM singals at right time for motors to spin|
+|Motors ( A2212 Brushless motors )|flys the drone by providing thrust|
 |PLA / PLA+ frame|hold all compenetns together so it can all fly in one peice|
-|battery|Power source|
+|battery (9 ManiaX 3S 2200 mAh) |Power source|
+|IMU Sensor (Adafruit LSM9DS1 Board)|gets gyro, accelerometer and magnometer data|
+|Thin Guage Wires ( 28AWG Silicone Wires) |wires for sending data from pin to pin under PCB|
+|PDB (PDB XT60 power distribution Board BEC) |Board to handle sending power from main battery to all 4 brusheless motors |
+|Radio Reciver (FS - iA6 Reciver Set) | recives radio signlas from RC controller |
+|Radio transmitter (FLYSKY FS-i6x) | transmitts radio signlas to Radio Reciver |
+
+
+
+
 
 Hardware diagrams and wiring can go in a hardware/ folder once you have them.
 
@@ -64,25 +74,25 @@ In autonomous mode, the drone will be able to go from point A to point B using a
 The overlap across I2C,SPI and UART peripherals combined with blocking Serial.print() calls inside the core control loop caused the ESP32 watchdog Timer (WDT) panics and memory corrutppion. Restructuring perpheral pin assighments, removing blocking serial calls fomr the fast loop, and enforcing non blocking millis() timing schhedules resotred determinsitc 250Hz ececution.
 
 # 🚀 Getting Started
-<!-- ✏️ EDIT: fill this in once your code is actually in the repo — this is a placeholder structure based on a typical embedded/Arduino project -->
-1. Clone the repo
-bash
-git clone <!-- ✏️ EDIT: your repo URL -->
-cd <!-- ✏️ EDIT: repo folder name -->
-2. Hardware setup
-<!-- ✏️ EDIT: list what someone needs to wire up / assemble before flashing firmware -->
-3. Flash the firmware
-<!-- ✏️ EDIT: e.g. Arduino IDE steps, board selection, upload instructions -->
-4. Power on and test
-<!-- ✏️ EDIT: what should happen when it powers on correctly? -->
-📌 Repo Status
-<!-- ✏️ EDIT: check these off honestly as you go, add/remove lines as needed -->
 
-✅ <!-- ✏️ EDIT: e.g. "Initial liftoff achieved" -->
+## 1. Hardware Assembly and Wiring Setup
+Connect the IMU using the I2C method. Connect the SCL port to GPIO 22 and SDA port to GPIO21. Make sure the rubber grommets are installed on the base of your plate for mechanical vibration isolation 
+FlySky Receiver (FS-iA6B): Connect the i-BUS RX to GPIO 16. 
+ESCs (4 X 30A): Connect PWM signal wires to GPIO 13( front right), GPIO 12(rear right, GPIO 14(rear left) and GPIO 27(front Left 
+Power Distribution: Verifty the 3S Lipo steps down through a 5V converter throught the PDB whihc then supplys clean power directly the the ESP32 5V pin bypassing motor EMF spikes. 
 
-🔧 <!-- ✏️ EDIT: e.g. "PID tuning for stable hover — in progress" -->
+## 2. Flash Firmware via Arduino Software 
+1. Open the project folder where VS code is and all librarys are installed
+2. Connect you ESP32 board via USB-C/Micro-USB
+3. Open Arduino and make sure you have right ESP32 board connected and upload_speed at 921600
+4. Hit run or send to flash code to ESP32
 
-⬜ <!-- ✏️ EDIT: e.g. "Autonomous waypoint navigation — not started" -->
+## 3. Bench Test and Verification Safety 
+1. REMOVE ALL PROPELLERS before power on with battery connected.
+2. Open Serial Monitor and check it is 115200 baud rate
+3. Power on the Fly sky controller and the Flysky reciver
+   - Check IMU has roll,pitch and yaw angles near 0 degrees when drone is on flat surface
+   - Check Reiver has incoming and outgoing singals goign out where it is between 1000 to 2000 microseconds. Can do visual check where if it is laggy, change  rate of of how fast reciver getting signals
 
 📂 Repository Structure
 <!-- ✏️ EDIT: update this to match your actual folder layout once files are uploaded -->
