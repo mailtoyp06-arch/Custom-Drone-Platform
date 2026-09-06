@@ -41,6 +41,24 @@ The PID works on 9 varibles which is PIDroll, cmdRoll, angleRoll, ROLL_kp, ROLL_
 ## PID varibles 
 | PID Varible | Purpose |
 |-----------|---------|
-|ROLL_KP|  |
-|Max yaw rate DPS = 150 | full yaw stick commands this rotation rate (deg/s) |
-|Arming throttle Max = 1090| Throttle must be below this to arm (safety) |
+|cmdRoll | maximum range or roll angle in degrees   |
+|angleRoll| desired roll angle of drone when gotten from RC controller  |
+|ROLL_KP| the gain factor for immediate error correction|
+|ROLL_KI| The gain factor for acccumilating persisten past errors |
+|ROLL_KD| The gain factor that reacts to how fast the error is changing |
+|dt| the exact time elapsed sicne last PID execution in seconds|
+|allowI| A bollean true/ false that enables or disables accumilation of integral term I |
+
+With these varibles defined I take each of these varibels for either roll, pitch or yaw. they all work on the same function 
+1. figure out the P using kp * error. 
+2. Use our first dual layer anti windup mechanism which is for the I term building up. This happens since when on the ground the error can addup even if you are slightly of center which is why I added this. 
+The code which is `  if (allowIntegral) {
+    s.integral += ki * error * dt;
+    s.integral = constrain(s.integral, -I_LIMIT, I_LIMIT); // added here 
+  } else {
+    s.integral = 0.0f;
+  } ' takes ki * error * dt. That integral term then gets constrainted within the limits or it becomes 0. 
+3. Get D derivative from angle of yaw,pitch or roll - previous angle of either of those 3 over dt. Then I used a EMA filter which used a low pass filter to the raw derivative value. Finally get real D term by using kd * that filter value of real d term.  
+4. For the actuall output, we then add the P, I and D term to get our actual output for the motors. 
+
+
