@@ -59,9 +59,12 @@ As you can see in Figure 3, using the triangles really helped since it was struc
 and all helps increase strenght. 
 In Figure 4, I designed the motor housing to be like a cup so that in the event the drone crashed, it would hit the side of the frame instead of just the motor. 
 Also, I made holes from the motor mount to the main body of the drone so that wires could easily go through the drone arm. 
-Figure 5 shows how I left the back open so that there could be a lot of space for the ESC to sit and also for air to go through. I just made it big just in case something happened, while making sure that structural stability was still there.
+Figure 5 shows how I left the back open so that there could be a lot of space for the ESC to sit and also for air to go through. I just made it big just in case something happened, while making sure that structural stability was still there. 
 
 ## The Slab ( V1 of drone ) 
+Having a the drone arms and the frames is just one part of flying a drone. But when how can it fly if there is no place for the microcontroller to sit on or be at in the frame which is why I build the slab. This part sits in teh middle of the drone where it sits the PCB. The PCB has the ESP32 and the IMU which power the drone for flying. the holes you can see on the side side of the slab is bascially for which the slab sits on. When I made the first version of drone arm, I didnt take that into account which then I accounted for in the next version fo the drone arm. It was a small alteration but nothing major. 
+
+When first desighning the slab, I made it in a hexagon shape sicne a circle or any other shape wouldnt work. You can see in figure blah, it fits very well. Along with making the slab, I also added holes to each of the 
 Making the drone arms and frames for bottom and top were cool. But none of it will work if there is not a place for the microcontroller to be on.  
 
 
