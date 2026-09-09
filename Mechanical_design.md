@@ -61,10 +61,39 @@ In Figure 4, I designed the motor housing to be like a cup so that in the event 
 Also, I made holes from the motor mount to the main body of the drone so that wires could easily go through the drone arm. 
 Figure 5 shows how I left the back open so that there could be a lot of space for the ESC to sit and also for air to go through. I just made it big just in case something happened, while making sure that structural stability was still there. 
 
+## The Fix for the holding the Slab ( V2 of Drone arm) 
+When I made the first design of the drone arm, I realized that there is no holes or place for the slab to sit on. The slab is talked in the next bullet point but bascially, the slab is a place where the PCB sits which holds the microcontrolelr and other components needed for flyignthe drone. F
+
+When tyring to quickly change the drone arm to fit the drone arm, I realized I also could redesign the drone arm again to be more more smaller while while almost keepign the same weight as V1 of drone arm. What I changed in V2 of the drone arm was make it more slender then V1 of drone arm and a more open design for the drone motor holding. As you can see across figures 6 - 8, the only thing I kept the same from V1 is the traingles on the side. Here are the main changes I made though for V2 of the drone arm. 
+-  made the frame rods for around the drone arm .15 inches instead of .10
+-  made the frame more traingular from a box shape in V1 of drone arm
+-  used 
+
+<table>
+  <tr>
+    <td align="center" valign="top" width="50%">
+      <img src="https://github.com/user-attachments/assets/a1476004-eac1-41d0-911e-ad7a1cab42d6" width="100%" alt="V2 Drone Arm View 1" />
+      <br>
+      <sub><b>Figure 6:</b> V2 drone arm design (View 1)</sub>
+    </td>
+    <td align="center" valign="top" width="50%">
+      <img src="https://github.com/user-attachments/assets/6f5773d6-833c-4c64-8a08-1e8a4d52b017" width="100%" alt="V2 Drone Arm View 2" />
+      <br>
+      <sub><b>Figure 7:</b> V2 drone arm design (View 2)</sub>
+    </td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/31670b1c-5d6a-4c90-b81f-8151292a89cd" width="70%" alt="V2 Drone Arm View 3" />
+  <br>
+  <sub><b>Figure 8:</b> V2 drone arm detail</sub>
+</p>
+
 ## The Slab ( V1 of drone ) 
 Having a the drone arms and the frames is just one part of flying a drone. But when how can it fly if there is no place for the microcontroller to sit on or be at in the frame which is why I build the slab. This part sits in teh middle of the drone where it sits the PCB. The PCB has the ESP32 and the IMU which power the drone for flying. the holes you can see on the side side of the slab is bascially for which the slab sits on. When I made the first version of drone arm, I didnt take that into account which then I accounted for in the next version fo the drone arm. It was a small alteration but nothing major. 
 
-When first desighning the slab, I made it in a hexagon shape sicne a circle or any other shape wouldnt work. You can see in figure blah, it fits very well. Along with making the slab, I also added holes to each of the 
+When first desighning the slab, I made it in a hexagon shape sicne a circle or any other shape wouldnt work. You can see in figure blah, it fits very well. Along with making the slab, I also added holes to each of the sides to make sure it can can sit on the holes of the drone arm. 
 Making the drone arms and frames for bottom and top were cool. But none of it will work if there is not a place for the microcontroller to be on.  
 
 
