@@ -67,7 +67,9 @@ When I made the first design of the drone arm, I realized that there is no holes
 When tyring to quickly change the drone arm to fit the drone arm, I realized I also could redesign the drone arm again to be more more smaller while while almost keepign the same weight as V1 of drone arm. What I changed in V2 of the drone arm was make it more slender then V1 of drone arm and a more open design for the drone motor holding. As you can see across figures 6 - 8, the only thing I kept the same from V1 is the traingles on the side. Here are the main changes I made though for V2 of the drone arm. 
 -  made the frame rods for around the drone arm .15 inches instead of .10
 -  made the frame more traingular from a box shape in V1 of drone arm
--  used 
+-  made a hole near the drone motor mount so that wires has less stress instead of forcing them to go up like in V1 of drone arm
+-  added a rectangualr hole at the bottom of the drone arm so that wires can easily be accesed if need be
+-  made the insdie of the drone arm bigger realzing that V1 of drone arm was a bit small to acess wires. 
 
 <table>
   <tr>
@@ -91,9 +93,80 @@ When tyring to quickly change the drone arm to fit the drone arm, I realized I a
 </p>
 
 ## The Slab ( V1 of drone ) 
-Having a the drone arms and the frames is just one part of flying a drone. But when how can it fly if there is no place for the microcontroller to sit on or be at in the frame which is why I build the slab. This part sits in teh middle of the drone where it sits the PCB. The PCB has the ESP32 and the IMU which power the drone for flying. the holes you can see on the side side of the slab is bascially for which the slab sits on. When I made the first version of drone arm, I didnt take that into account which then I accounted for in the next version fo the drone arm. It was a small alteration but nothing major. 
+Having the drone arms and the frames is just one part of flying a drone. But how can it fly if there is no place for the microcontroller to sit on or be at in the frame, which is why I built the slab. This part sits in the middle of the drone, where the PCB sits. The PCB has the ESP32 and the IMU, which power the drone for flying. The holes you can see on the sides of the slab are basically what the slab sits on. When I made the first version of the drone arm, I didn't take that into account, which I then accounted for in the next version of the drone arm. It was a small alteration, but nothing major.
 
-When first desighning the slab, I made it in a hexagon shape sicne a circle or any other shape wouldnt work. You can see in figure blah, it fits very well. Along with making the slab, I also added holes to each of the sides to make sure it can can sit on the holes of the drone arm. 
-Making the drone arms and frames for bottom and top were cool. But none of it will work if there is not a place for the microcontroller to be on.  
+When first designing the slab, I made it in a hexagon shape since a circle or any other shape wouldn't work. As you can see in Figure 9, it fits very well. Along with making the slab, I also added holes to each of the sides to make sure it can sit on the holes of the drone arm. I also added depth for the slab, since when the PCB sits, there needs to be space underneath for the wiring and the solder underneath, which is why it is about .10 inches deep. Along with that, on the sides, I added slots on 4 out of the six sides, since if I ever need a wire or anything for the ESP32 or IMU sensor, that could work too. The last thing I had to add before this could all work was a hole through the part, since obviously, there needs to be some hole so wires can connect to the PDB at the bottom, which is what I did in Figure 10.
+
+<table>
+  <tr>
+    <td align="center" valign="top" width="50%">
+      <img src="https://github.com/user-attachments/assets/2a592202-6dfb-49ea-abab-49a7aee79dd5" width="100%" alt="Slab Design View 1" />
+      <br>
+      <sub><b>Figure 9:</b> Slab design (Side View)</sub>
+    </td>
+    <td align="center" valign="top" width="50%">
+      <img src="https://github.com/user-attachments/assets/40d9c3ac-d119-4d11-8137-49bc77555895" width="100%" alt="Slab Design View 2" />
+      <br>
+      <sub><b>Figure 10:</b> Slab design (Top view)</sub>
+    </td>
+  </tr>
+</table>
+
+## The Landing Gear ( V1 of drone ) 
+
+How will this drone land if there is no landing gear? My first inspiration came from helicopter landing gears, which have skids on them—static landing gears that absorb impact upon landing. I wanted to build those, but soon realized that by the time I was designing these landing gears, I had not built my first prototype together at all, so I tried to quickly within a day make a landing gear that would work, but would be crap. As you can see in Figure 11, it was very flimsy, but did the job of landing. I used a press fit for the pins at the top of the landing gear, where I had a .04-inch tolerance. A somewhat tight fit, but still a little loose. All I needed from this landing gear was that it would work and that it would not break upon impact. I tested this landing gear by dropping it from 5, 10, and 15 feet without the whole setup. It survived. Now with the whole setup at five feet, when I dropped it, there was a small crack. Seeing this crack, I printed 5 of these types of landing gears since they barely took any 3D filament. I knew that for V2 of the landing gear, it would have to be well thought out and way thicker and spread out to distribute the landing forces.
+
+<table>
+  <tr>
+    <td align="center" valign="top" width="50%">
+      <img src="https://github.com/user-attachments/assets/09c6e63f-d8f5-4956-add4-9585b0ffaedf" width="100%" alt="Landing Gear View 1" />
+      <br>
+      <sub><b>Figure 11:</b> Landing gear design (View 1)</sub>
+    </td>
+    <td align="center" valign="top" width="50%">
+      <img src="https://github.com/user-attachments/assets/3bc030e1-2e43-4f0b-99cb-2971219cc3a9" width="100%" alt="Landing Gear View 2" />
+      <br>
+      <sub><b>Figure 12:</b> Landing gear design (View 2)</sub>
+    </td>
+  </tr>
+</table>
+
+## Putting Everything together ( V1 of Drone ) 
+
+When I first put everything together, I was in awe. It was amazing. By this time, I still hadn't finished my code for flying the drone. I was about 85% done and knew there were going to be some software bugs, but I knew my frame for the drone was perfect. Little did I know there was impending doom and version 2 of the drone was desperately needed. You can see the full build of version 1 of the drone below.
+
+<table>
+  <tr>
+    <td align="center" valign="top" width="50%">
+      <img src="https://github.com/user-attachments/assets/0ed93fd9-9f44-4153-b8da-d6ddde3ca10d" width="100%" alt="Full Drone Build View 1" />
+      <br>
+      <sub><b>Figure 13:</b> Full drone build V1 (Isometric view)</sub>
+    </td>
+    <td align="center" valign="top" width="50%">
+      <img src="https://github.com/user-attachments/assets/812278b4-3b19-4dc7-94a3-7b7de0c34bb2" width="100%" alt="Full Drone Build View 2" />
+      <br>
+      <sub><b>Figure 14:</b> Full drone build V1 (Top view)</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" valign="top" width="50%">
+      <img src="https://github.com/user-attachments/assets/1e2d6871-4e80-49a4-bedf-d295c697e648" width="100%" alt="Full Drone Build View 3" />
+      <br>
+      <sub><b>Figure 15:</b> Full drone build V1 (Side view)</sub>
+    </td>
+    <td align="center" valign="top" width="50%">
+      <img src="https://github.com/user-attachments/assets/7c672e4b-9acc-4a02-bfe5-99fd8c118f66" width="100%" alt="Full Drone Build View 4" />
+      <br>
+      <sub><b>Figure 16:</b> Full drone build V1 (Detail view)</sub>
+    </td>
+  </tr>
+</table>
+
+
+
+
+
+
+
 
 
