@@ -1,6 +1,5 @@
 # Custom-Drone-Platform
 <p align="center"> <img src="media/drone_full_build.jpg" width="300"> </p> <!-- ✏️ EDIT: swap in your own photo filename above, or delete this block until you have one -->
-Custom Autonomous Quadcopter Platform
 <p align="center"> <img src="https://img.shields.io/badge/Platform-Arduino-red?style=flat-square"> <img src="https://img.shields.io/badge/Language-C%2B%2B-blue?style=flat-square"> <img src="https://img.shields.io/badge/PCB-Custom%20Design-orange?style=flat-square"> <img src="https://img.shields.io/badge/License-MIT-lightgrey?style=flat-square"> </p> <!-- ✏️ EDIT: update/add badges — e.g. swap "Arduino" for your actual flight controller/MCU, add a "Status-In Progress" badge -->
 
 I built a custom-built quadcopter, specifically, the frame, custom PCB, and flight control firmware, with off-the-shelf components (motors, ESCs, sensors) integrated into the system. Built in two variants: a manually piloted RC version and an autonomous version.
