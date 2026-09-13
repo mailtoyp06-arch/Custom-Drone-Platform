@@ -1,11 +1,9 @@
 # Angle Calculation from IMU data 
 ## Correct Data calculation from Raw Data  
-Getting data from the IMU is gives very scramblled data whcih is wrong and misleading. To get the right data, I first callibrated the 
-IMU to get its offset since any sensor from the factory is never perfect at giving accurate data. I used a calibration website for IMUs 
-which calibrated in the x,y and z for the gyro, accelerometer and magnometer. 
-  - For the gyro, I averaged the raw data from each of the 3 axes which gave me my offset 
-  - For the accelerometer, when spinning it in all 3 axis for magnometer, I had the website get the average raw data for me which then subtracted from one 1g since earths gravity gave me my offset for Z. 
-  - For the magnometer, I found the max and minimum raw values recorded across a full rotation for each axis divided by 2 for each axis. From there, the range for each x,y and z, I divded by 3. That average range I again divded by each range x,y and z whcih got me my scale for each axis for the magnometer. 
+aw data directly from the IMU can be noisy and inaccurate. To ensure precise measurements, I first calibrated the IMU to calculate its zero-offset, as factory sensors inherently carry small measurement errors. Using an IMU calibration tool, I calculated the offsets and scaling factors across the X, Y, and Z axes for the gyroscope, accelerometer, and magnetometer: 
+  - For the gyro, I averaged the raw data across all three axes while stationary to determine the baseline zero-offset.
+  - For the accelerometer, While rotating the sensor across all three axes, I captured the average raw data baseline and subtracted $1\text{ g}$ (Earth's gravity) to determine the Z-axis offset. 
+  - For the magnometer, I recorded the maximum and minimum raw values across a full 360-degree rotation on each axis to find the center offset (averaging the min and max divided by 2). I then computed the average range across all three axes divided by each individual axis range to determine the scaling factor for the X, Y, and Z axes. 
 
 ## Calculating Angles from Correct data 
 Once all the data from teh IMU is right based on those offsets and scaling factors, I calculated the angles for roll, pitch and yaw. 
