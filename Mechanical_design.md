@@ -162,6 +162,12 @@ When I first put everything together, I was in awe. It was amazing. By this time
   </tr>
 </table>
 
+# Version 2 of Drone 
+
+## Mistakes from V1 drone 
+
+When making the V1 drone, I realized that there were some mistakes for the V1 drone which affected flight operations and attachments for the drone. 
+
 
 
 
